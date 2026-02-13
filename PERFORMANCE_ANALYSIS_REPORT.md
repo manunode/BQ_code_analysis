@@ -13,9 +13,9 @@
 | Severity | Count |
 |----------|-------|
 | CRITICAL | 8 |
-| HIGH | 14 |
+| HIGH | 13 |
 | MEDIUM | 12 |
-| LOW | 7 |
+| LOW | 8 |
 | **Total** | **41** |
 
 ### Estimated Aggregate Improvement Potential
@@ -28,7 +28,7 @@
 
 1. **N+1 queries in list row rendering** — Every row fires 1-3 extra SELECT queries (CRITICAL)
 2. **Zero application-level caching** — Metadata, constants, and configs re-queried every request (CRITICAL)
-3. **`SELECT *` everywhere** — All queries fetch full rows even when 1-2 columns needed (HIGH)
+3. **Table-level LOCK for auto-ID** — `getAutoId()` uses TABLE LOCK blocking all concurrent writes (HIGH)
 4. **Encryption calls per row** — `pw_enc()` called 5-15 times per list row inside loops (HIGH)
 5. **Triple-read on update** — `updateRecord()` reads the record 3 times (before, during, after) (HIGH)
 
@@ -62,35 +62,37 @@ $childtablename = getValueForPS("selrec tablename from _pb_pagehead where pgid=?
     "s",$v['url']);
 ```
 
-**Problem:** For a page with 20 rows and 3 links each:
-- 20 rows x 1 query (getlinelinks) = 20 queries
-- 20 rows x 1 query (getlinelinksnew) = 20 queries
-- 20 rows x 3 links x 1 query (child table lookup) = 60 queries
-- **Total: ~100 extra queries per page load** (on top of the main list query)
+**Problem:** The issue is NOT about `SELECT *` vs specific columns — each query hits a PK index and returns one row, so column selection is negligible. The issue is the **number of database round trips**. Each `getValueForPS()` call is a full network round trip to MySQL (PHP → TCP/socket → MySQL parse → execute → return → PHP processes result). Even on a fast local connection this costs ~0.5-2ms; on a network connection to the DB server (e.g. `10.1.2.6`) it can be 2-5ms per round trip.
+
+For a page with 20 rows and 3 links each:
+- 20 rows x 1 query (getlinelinks re-reads the same row the main loop already fetched) = 20 round trips
+- 20 rows x 1 query (getlinelinksnew re-reads the exact same row again) = 20 round trips
+- 20 rows x 3 links x 1 query (child table lookup — same pgid→tablename looked up for every row) = 60 round trips
+- **Total: ~100 extra round trips × ~2ms each ≈ 200ms of pure network wait per page load**
+
+The row data is already available in `$ds` from the main `while` loop. The child table names are identical across all rows (same page links apply to every row). These queries are redundant, not just suboptimal.
 
 **Fix:**
 ```php
-// 1. The main list query already has the row data — pass $ds directly:
+// 1. The main list query already has the row data in $ds — pass it through:
 function getlinelinksnew($id, $rowData) {
-    // Use $rowData instead of re-querying
+    // Use $rowData instead of re-querying the same record
     $recDs = $rowData;
     // ...
 }
 
-// 2. Pre-fetch all child table names once before the loop:
-$linkPgids = array_column($_SESSION['currentpage']['links'], 'url');
-$placeholders = implode(',', array_fill(0, count($linkPgids), '?'));
-$formats = str_repeat('s', count($linkPgids));
+// 2. Pre-fetch child table names ONCE before the row loop (they're the same for every row):
 $childTables = [];
-$rs = PW_sql2rsPS("selrec pgid, tablename FROM _pb_pagehead WHERE pgid IN ($placeholders)",
-    $formats, ...$linkPgids);
-while ($row = PW_fetchAssoc($rs)) {
-    $childTables[$row['pgid']] = $row['tablename'];
+foreach ($_SESSION['currentpage']['links'] as $v) {
+    if (!isset($childTables[$v['url']]) && !isFoundIn($v['url'], '.php')) {
+        $childTables[$v['url']] = getValueForPS(
+            "selrec tablename from _pb_pagehead where pgid=?", "s", $v['url']);
+    }
 }
-// Then inside the loop: $childtablename = $childTables[$v['url']] ?? null;
+// Then inside the row loop: $childtablename = $childTables[$v['url']] ?? null;
 ```
 
-**Expected Improvement:** 100 queries → 2 queries. **~50x faster** for list rendering.
+**Expected Improvement:** ~100 round trips → ~5 round trips (1 main query + 1 count + a few link lookups). Saves ~190ms of network wait on a 20-row page.
 
 ---
 
@@ -204,27 +206,27 @@ function insertRecord($array, $table_name, $audit=1){
 
 ---
 
-#### [PERF-005] SELECT * Used Everywhere
-**Impact:** HIGH
+#### [PERF-005] SELECT * on Single-Row PK Lookups — Low Priority
+**Impact:** LOW
 **Files:** Throughout codebase — 30+ occurrences
 
-**Examples:**
+**Note:** For single-row lookups by primary key (which most of these are), the difference between `SELECT *` and `SELECT specific_columns` is **negligible**. MySQL reads the entire row from the data page regardless of which columns are requested — the InnoDB clustered index stores the full row. The only overhead is slightly more data transferred over the wire and slightly more PHP memory, which is minimal for a single row.
+
+**Examples where it genuinely doesn't matter much:**
 ```php
-// bq_list_table.php:758 — Only needs hideon, requests, linktype fields
-$recDs = getValueForPS("selrec * from ".$table." where id=?","s",$id);
-
-// bq_list_edit.php:82 — Loads ALL columns for edit form
+// Single-row PK lookups — SELECT * is fine here:
 $dataDS = getValueForPS("selrec * from ".$activepagetable." where id=?","s",$id);
-
-// bq_indi_engine.php:1872 — User session setup
 $userDs = getValueForPS("selrec * from _pb_entity where userid=?...","s",$userid);
-
-// bq_list_edit_action.php:37 — Delete check
-$pgds = getValueForPS("selrec * from _pb_pagehead where pgid=?","s",$_GET['pgid']);
-// Only needs: tablename
 ```
 
-**Problem:** `SELECT *` fetches all columns (potentially 30-50 per table) when only 1-5 are needed. This wastes network bandwidth, MySQL memory buffers, and PHP memory.
+**Where it WOULD matter (multi-row result sets with wide tables):**
+```php
+// List queries that return 20+ rows — specify columns to reduce transfer:
+// bq_list_table.php main list query should use the listfields from metadata
+// rather than SELECT * when the table has 30+ columns but only 5-6 are displayed
+```
+
+**Problem (revised):** `SELECT *` is not a significant concern for single-row PK lookups. It only becomes meaningful for multi-row result sets on wide tables, or when large TEXT/BLOB columns are fetched unnecessarily. This is a code hygiene issue more than a performance bottleneck.
 
 **Fix:** Specify only needed columns:
 ```php
